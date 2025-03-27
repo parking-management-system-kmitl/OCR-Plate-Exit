@@ -9,22 +9,223 @@ from autoTransform.transform import process_auto_transform
 from splitImage.split import process_split_image
 from readLicense.read import process_read_license
 from ultralytics import YOLO
-
+import tkinter as tk
+from tkinter import ttk
+import RPi.GPIO as GPIO
+import subprocess
 import warnings
+import requests
+import io
+import numpy as np
+import datetime
+
 warnings.filterwarnings("ignore")
 
-# กำหนดค่าเริ่มต้น
-YOLO_WIDTH = 640  # ขนาดสำหรับ YOLO detection
+# Constants
+YOLO_WIDTH = 640
 YOLO_HEIGHT = 640
-OCR_SIZE = 224   # ขนาดสำหรับ OCR
-DISPLAY_WIDTH = 640  # ขนาดสำหรับแสดงผล
+OCR_SIZE = 224
+DISPLAY_WIDTH = 640
 DISPLAY_HEIGHT = 480
-FPS = 30
+FPS = 60
+
+# GPIO pins
+RED_LIGHT_PIN = 16
+GREEN_LIGHT_PIN = 18
+IR_SENSOR_PIN = 22
+
+# Trigger Zone
+ZONE_LEFT = 30
+ZONE_RIGHT = 70
+ZONE_TOP = 0
+ZONE_BOTTOM = 100
 
 stop_event = threading.Event()
+last_successful_plate = None
+current_frame = None
+#API_URL = "http://jjsornwakii.3bbddns.com:34724/parking/exit"
+API_URL = "http://10.240.67.29:3000/parking/exit"
+
+def setup_gpio():
+    """Initialize GPIO settings"""
+    try:
+        GPIO.cleanup()
+    except:
+        pass
+    
+    GPIO.setmode(GPIO.BOARD)
+    GPIO.setup(RED_LIGHT_PIN, GPIO.OUT, initial=GPIO.LOW)
+    GPIO.setup(GREEN_LIGHT_PIN, GPIO.OUT, initial=GPIO.LOW)
+    GPIO.setup(IR_SENSOR_PIN, GPIO.IN)
+    
+    print("GPIO setup completed")
+
+def control_lights(red_state, green_state):
+    """Control LED lights"""
+    GPIO.output(RED_LIGHT_PIN, GPIO.HIGH if red_state else GPIO.LOW)
+    GPIO.output(GREEN_LIGHT_PIN, GPIO.HIGH if green_state else GPIO.LOW)
+
+def turn_red():
+    """Turn on red light, turn off green light"""
+    control_lights(True, False)
+
+def turn_green():
+    """Turn on green light, turn off red light"""
+    control_lights(False, True)
+
+def cleanup_gpio():
+    """ทำความสะอาด GPIO เมื่อจบโปรแกรม"""
+    try:
+        GPIO.setmode(GPIO.BOARD)  # ต้องตั้ง mode ก่อน cleanup
+        GPIO.cleanup()  # ทำความสะอาด GPIO ทั้งหมด
+    except Exception as e:
+        print(f"GPIO cleanup error: {str(e)}")
+
+# เพิ่มฟังก์ชันใหม่สำหรับจัดการเวลา
+def get_formatted_time():
+    """คืนค่าเวลาปัจจุบันในรูปแบบ HH:MM:SS"""
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+
+def send_exit_request(license_plate: str, ocr_results_queue):
+    """Send exit request to server and handle the response"""
+    try:
+        data = {"licensePlate": license_plate}
+        response = requests.post(API_URL, json=data)
+        response_data = response.json()
+
+        if response.status_code == 200:
+            status_message = "อนุญาตให้ออกได้"
+            print(f"✅ Exit request successful for: {license_plate}")
+            ocr_results_queue.put({
+                'status': status_message,
+                'payment': "ชำระแล้ว"
+            })
+            turn_green()
+            return True
+        elif response.status_code == 400:
+            if 'paymentDetails' in response_data:
+                amount_due = response_data['paymentDetails']['amountDue']
+                status_message = "ไม่สามารถออกได้"
+                payment_message = f"ต้องชำระ {amount_due} บาท"
+                
+                ocr_results_queue.put({
+                    'status': status_message,
+                    'payment': payment_message
+                })
+            else:
+                status_message = "เกิดข้อผิดพลาด"
+                ocr_results_queue.put({
+                    'status': status_message,
+                    'payment': "ไม่สามารถตรวจสอบได้"
+                })
+            turn_red()
+            return False
+        else:
+            print(f"❌ Exit request failed: {response_data}")
+            status_message = "เกิดข้อผิดพลาด"
+            ocr_results_queue.put({
+                'status': status_message,
+                'payment': "ไม่สามารถตรวจสอบได้"
+            })
+            turn_red()
+            return False
+
+    except Exception as e:
+        print(f"❌ Error in exit request: {str(e)}")
+        status_message = "เกิดข้อผิดพลาด"
+        ocr_results_queue.put({
+            'status': status_message,
+            'payment': "ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์"
+        })
+        turn_red()
+        return False
+
+def ir_light_controller():
+    """Control lights based on IR sensor status"""
+    last_state = None
+    
+    # Start with red light
+    control_lights(True, False)
+    print("System initialized - Red light on")
+    
+    while not stop_event.is_set():
+        try:
+            current_ir_state = GPIO.input(IR_SENSOR_PIN)
+            
+            if current_ir_state != last_state:
+                if current_ir_state == GPIO.HIGH:  # Object detected
+                    print("IR Sensor: Object detected - Waiting 2 seconds")
+                    time.sleep(2)
+                    print("2 seconds passed - Red light on")
+                    control_lights(True, False)
+                last_state = current_ir_state
+            
+            time.sleep(0.1)
+            
+        except Exception as e:
+            print(f"IR controller error: {str(e)}")
+            time.sleep(1)
+
+def update_gui(ocr_results_queue, plate_label, time_label, status_label, payment_label):
+    while True:
+        try:
+            result = ocr_results_queue.get_nowait()
+            
+            if isinstance(result, dict):
+                if 'plate' in result:
+                    plate_text = result.get('plate', '')
+                    time_text = result.get('time', '')
+                    plate_label.config(text=f"ทะเบียน: {plate_text}")
+                    time_label.config(text=f"เวลา: {time_text}")
+                
+                if 'status' in result:
+                    status_text = result.get('status', '')
+                    payment_text = result.get('payment', '')
+                    status_label.config(text=status_text)
+                    payment_label.config(text=payment_text)
+
+        except queue.Empty:
+            pass
+        except Exception as e:
+            print(f"GUI update error: {str(e)}")
+        
+        time.sleep(0.1)
+
+def add_padding_to_bbox(xmin, ymin, xmax, ymax, frame_height, frame_width, padding_percent=10):
+    """
+    เพิ่มพื้นที่ padding รอบ bounding box โดยรักษาขอบเขตของ frame
+    
+    Args:
+        xmin, ymin, xmax, ymax: พิกัดของ bounding box
+        frame_height, frame_width: ขนาดของ frame
+        padding_percent: เปอร์เซ็นต์ของ padding ที่ต้องการเพิ่ม (default: 10%)
+    
+    Returns:
+        tuple: (xmin, ymin, xmax, ymax) ที่มี padding แล้ว
+    """
+    # คำนวณขนาดของ padding
+    width = xmax - xmin
+    height = ymax - ymin
+    padding_x = int(width * padding_percent / 100)
+    padding_y = int(height * padding_percent / 100)
+    
+    # เพิ่ม padding และตรวจสอบขอบเขต
+    new_xmin = max(0, xmin - padding_x)
+    new_ymin = max(0, ymin - padding_y)
+    new_xmax = min(frame_width, xmax + padding_x)
+    new_ymax = min(frame_height, ymax + padding_y)
+    
+    return new_xmin, new_ymin, new_xmax, new_ymax
+
 
 def capture_frame(cap, frame_queue):
-    frame_count = 0
+    # ตั้งค่า buffer size ของ OpenCV
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    
+    # ตั้งค่า FPS ของกล้อง
+    cap.set(cv2.CAP_PROP_FPS, 1)  # ปรับเป็น 30 FPS
+    
     while not stop_event.is_set():
         ret, frame = cap.read()
         if not ret:
@@ -32,156 +233,297 @@ def capture_frame(cap, frame_queue):
             stop_event.set()
             break
         
-        if frame_count % 5 == 0:
-            if not frame_queue.full():
-                frame_queue.put(frame)
+        # ล้าง frame เก่าออกจาก queue
+        while not frame_queue.empty():
+            try:
+                frame_queue.get_nowait()
+            except queue.Empty:
+                break
         
-        frame_count += 1
+        frame_queue.put(frame)
 
-def process_frame(frame_queue, model, last_ocr_time, trigger_zone, model_path, font_path, ocr_results):
+def process_frame(frame_queue, model, last_ocr_time, trigger_zone, model_path, font_path, ocr_results_queue):
+    global last_successful_plate
+    
     object_in_zone = False
+    last_successful_plate = None
+    waiting_for_exit = False
+    trigger_start_time = 0
+    last_ocr_time = time.time()
+    min_confidence_threshold = 0.6
+
+
+        # สร้างหน้าต่างแสดงภาพทั้งหมดครั้งเดียวตอนเริ่มต้น
+    #cv2.namedWindow("License Plate Original", cv2.WINDOW_NORMAL)
+    #cv2.namedWindow("License Plate Processed", cv2.WINDOW_NORMAL)
+    #cv2.namedWindow("License Plate Transformed", cv2.WINDOW_NORMAL) 
+    #cv2.namedWindow("License Plate OCR Input", cv2.WINDOW_NORMAL)
+
+    # กำหนดขนาดหน้าต่างครั้งเดียว
+    #cv2.resizeWindow("License Plate Original", 400, 200)
+    #cv2.resizeWindow("License Plate Processed", 400, 200)
+    #cv2.resizeWindow("License Plate Transformed", 400, 200)
+    #cv2.resizeWindow("License Plate OCR Input", 400, 200)
+    
     while not stop_event.is_set():
-        if not frame_queue.empty():
-            original_frame = frame_queue.get()
+        try:
+            original_frame = frame_queue.get(timeout=1)
             
-            # สร้าง copy สำหรับ YOLO model ขนาด 640x640
+            # Resize frame for YOLO processing
             yolo_frame = cv2.resize(original_frame.copy(), (YOLO_WIDTH, YOLO_HEIGHT))
             
-            # วาด Trigger Zone บน frame จริง
+            # Calculate scaling factors
             height, width = original_frame.shape[:2]
             scale_x = width / YOLO_WIDTH
             scale_y = height / YOLO_HEIGHT
             
+            # Calculate actual trigger zone coordinates
             actual_trigger_zone = (
                 (int(trigger_zone[0][0] * scale_x), int(trigger_zone[0][1] * scale_y)),
                 (int(trigger_zone[1][0] * scale_x), int(trigger_zone[1][1] * scale_y))
             )
             
+            # Draw initial trigger zone
             cv2.rectangle(original_frame, actual_trigger_zone[0], actual_trigger_zone[1], (255, 0, 0), 2)
 
-            # ตรวจจับวัตถุด้วย YOLO
-            #results = model.predict(yolo_frame)[0]
-            # ตรวจจับวัตถุด้วย YOLO และปิดการแสดง stats
+            # Run YOLO detection
             results = model.predict(yolo_frame, verbose=False)[0]
-
+            
+            # Process detection results
+            plate_in_zone = False
             if len(results.boxes) > 0:
                 for box in results.boxes:
                     coords = box.xyxy[0].cpu().numpy()
                     conf = float(box.conf)
                     cls = int(box.cls)
 
-                    # ข้ามถ้าความมั่นใจต่ำเกินไป
                     if conf < model.conf:
                         continue
                     
+                    # Calculate real coordinates
                     xmin, ymin, xmax, ymax = coords
-                    
-                    # แปลงพิกัดกลับไปยังขนาดจริง
                     real_xmin = int(xmin * scale_x)
                     real_ymin = int(ymin * scale_y)
                     real_xmax = int(xmax * scale_x)
                     real_ymax = int(ymax * scale_y)
 
-                    if cls in [0, 1]:  # car หรือ licenseplate
-                        real_cx = (real_xmin + real_xmax) // 2
-                        real_cy = (real_ymin + real_ymax) // 2
-
-                        # วาดกรอบและข้อความ
+                    if cls in [0, 1]:  # car or license plate
+                        # Draw bounding box
                         cv2.rectangle(original_frame, (real_xmin, real_ymin), (real_xmax, real_ymax), (0, 255, 0), 2)
                         label = f"{['car', 'licenseplate'][cls]}: {conf:.2%}"
                         cv2.putText(original_frame, label, (real_xmin, real_ymin - 10), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5 * max(scale_x, scale_y), (0, 255, 0), 2)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5 * max(scale_x, scale_y), (0, 255, 0), 2)
 
-                        # ตรวจสอบว่าอยู่ใน Trigger Zone
-                        if (actual_trigger_zone[0][0] < real_cx < actual_trigger_zone[1][0] and 
-                            actual_trigger_zone[0][1] < real_cy < actual_trigger_zone[1][1]):
-                            if not object_in_zone:
-                                object_in_zone = True
-                                trigger_start_time = time.time()
-                            elif time.time() - trigger_start_time >= 1:
-                                current_time = time.time()
-                                if current_time - last_ocr_time >= 2:
-                                    print("Starting OCR process.")
+                        # Check if license plate is in trigger zone
+                        in_trigger_zone = (
+                            real_xmin >= actual_trigger_zone[0][0] and
+                            real_xmax <= actual_trigger_zone[1][0] and
+                            real_ymin >= actual_trigger_zone[0][1] and
+                            real_ymax <= actual_trigger_zone[1][1]
+                        )
+                        
+                        if cls == 1 and in_trigger_zone:  # license plate in zone
+                            plate_in_zone = True
+                            if not waiting_for_exit:
+                                if not object_in_zone:
+                                    object_in_zone = True
+                                    trigger_start_time = time.time()
+                                elif time.time() - trigger_start_time >= 1:
+                                    current_time = time.time()
+                                    if current_time - last_ocr_time >= 1:  # 1 second delay between OCR attempts
+                                        # Perform OCR
 
-                                    # ตัดภาพป้ายทะเบียนและ resize เป็น 224x224 สำหรับ OCR
-                                    plate_img = original_frame[real_ymin:real_ymax, real_xmin:real_xmax]
-                                    plate_img = cv2.resize(plate_img, (OCR_SIZE, OCR_SIZE))
 
-                                    try:
-                                        transformed_img = process_auto_transform(plate_img)
-                                        top_img, _ = process_split_image(transformed_img)
-                                        results, confidence = process_read_license(top_img, model_path, font_path)
+                                        
+                                        
+                                        # เพิ่ม padding ให้กับ bounding box
+                                        padded_xmin, padded_ymin, padded_xmax, padded_ymax = add_padding_to_bbox(
+                                            real_xmin, real_ymin, real_xmax, real_ymax,
+                                            original_frame.shape[0], original_frame.shape[1],
+                                            padding_percent=10 # ปรับค่านี้ตามความเหมาะสม
+                                        )
+                                        
+                                        # ตัดภาพด้วย padding
+                                        plate_img = original_frame[padded_ymin:padded_ymax, padded_xmin:padded_xmax]
+                                        
+                                        
+                                        
+                                        
+                                        #plate_img = original_frame[real_ymin:real_ymax, real_xmin:real_xmax]
 
-                                        text = ''.join([char for char, _, _ in results])
-                                        print(f"\nDetected: {text}")
-                                        print(f"Confidence: {confidence:.2%}")
 
-                                        ocr_results.append((text, confidence))
 
-                                        best_result = max(ocr_results, key=lambda x: x[1])
-                                        print(f"Best Detected: {best_result[0]} with Confidence: {best_result[1]:.2%}")
+                                        if plate_img.size > 0:  # Check if plate image is valid
+                                            try:
 
-                                    except Exception as e:
-                                        print(f"OCR Error: {str(e)}")
-                        else:
-                            object_in_zone = False
+                                                # แสดงภาพโดยใช้ imshow อย่างเดียว ไม่ต้องสร้างหน้าต่างใหม่
+                                                #cv2.imshow("License Plate Original", cv2.resize(plate_img, (400, 200)))
+                                                
+                                                # preprocessing
+                                                plate_img = cv2.resize(plate_img, (OCR_SIZE, OCR_SIZE))
+                                                plate_img_gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+                                                plate_img_eq = cv2.equalizeHist(plate_img_gray)
+                                                plate_img = cv2.cvtColor(plate_img_eq, cv2.COLOR_GRAY2BGR)
+                                                #cv2.imshow("License Plate Processed", cv2.resize(plate_img, (400, 200)))
+                                                
+                                                # transform
+                                                transformed_img = process_auto_transform(plate_img)
+                                                #cv2.imshow("License Plate Transformed", cv2.resize(transformed_img, (400, 200)))
+                                                
+                                                # split
+                                                top_img, _ = process_split_image(transformed_img)
+                                                #cv2.imshow("License Plate OCR Input", cv2.resize(top_img, (400, 200)))
+                                    
+                                                results, confidence = process_read_license(top_img, model_path, font_path)
 
-            # แสดงผล
+                                                #plate_img = cv2.resize(plate_img, (OCR_SIZE, OCR_SIZE))
+                                                #transformed_img = process_auto_transform(plate_img)
+                                                #top_img, _ = process_split_image(transformed_img)
+                                                #results, confidence = process_read_license(top_img, model_path, font_path)
+                                                
+                                                text = ''.join([char for char, _, _ in results])
+                                                
+                                                if text and confidence >= min_confidence_threshold:
+                                                    current_time = get_formatted_time()
+                                                    
+                                                    if text != last_successful_plate:
+                                                        print(f"\nDetected new license plate: {text}")
+                                                        print(f"Confidence: {confidence:.2%}")
+                                                        print(f"Time: {current_time}")
+                                                        
+                                                        # Update GUI with plate info
+                                                        ocr_results_queue.put({
+                                                            'plate': text,
+                                                            'time': current_time,
+                                                            'confidence': confidence
+                                                        })
+                                                        
+                                                        # Send exit request automatically
+                                                        send_exit_request(text, ocr_results_queue)
+                                                        
+                                                        last_successful_plate = text
+                                                        waiting_for_exit = True
+                                                    
+                                                    last_ocr_time = time.time()
+                                            except Exception as e:
+                                                print(f"OCR Error: {str(e)}")
+                                                continue
+
+            # Update trigger zone color based on detection
+            trigger_zone_color = (0, 0, 255) if plate_in_zone else (255, 0, 0)
+            cv2.rectangle(original_frame, actual_trigger_zone[0], actual_trigger_zone[1], trigger_zone_color, 2)
+
+            # Reset waiting state if no plate in zone
+            if not plate_in_zone and waiting_for_exit:
+                waiting_for_exit = False
+                print(f"License plate {last_successful_plate} has left the trigger zone")
+                last_successful_plate = None
+
+            # Display the frame
             display_frame = cv2.resize(original_frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
             cv2.imshow("CCTV Stream", display_frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
-                print("กำลังหยุดการทำงาน...")
+                print("Stopping...")
                 stop_event.set()
                 break
 
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"Processing error: {str(e)}")
+            continue
+
 def main():
     try:
-        model_path = "readLicense/EfficientNet_model.pth"
+        model_path = "readLicense/EfficientNet_model3.pth"
         yolo_model_path = "detectCar/yolov8/best_v8_2.pt"
         font_path = "AnantasonReno-SemiExpanded-Italic.otf"
         capture_dir = "captured_plates"
         os.makedirs(capture_dir, exist_ok=True)
 
+        # Initialize GPIO
+        setup_gpio()
+
+        # Setup ML model
         model = YOLO(yolo_model_path)
-        model.conf = 0.6
-        model.max_det = 2
+        model.conf = 0.5
+        model.max_det = 1
 
-        #cap = cv2.VideoCapture(0)
-        cap = cv2.VideoCapture("rtsp://admin:kmitl2025@192.168.1.64:554/stream")
+        frame_queue = queue.Queue(maxsize=1)
+        ocr_results_queue = queue.Queue()
+
+        # Create GUI
+        root = tk.Tk()
+        root.title("ระบบตรวจสอบการออก")
+        
+        # Create labels with larger font
+        plate_label = ttk.Label(root, text="ทะเบียน: -", font=("Helvetica", 80))
+        plate_label.pack(pady=20)
+        
+        time_label = ttk.Label(root, text="เวลา: -", font=("Helvetica", 80))
+        time_label.pack(pady=20)
+        
+        status_label = ttk.Label(root, text="สถานะ: -", font=("Helvetica", 80))
+        status_label.pack(pady=20)
+        
+        payment_label = ttk.Label(root, text="การชำระเงิน: -", font=("Helvetica", 80))
+        payment_label.pack(pady=20)
+
+        # Start threads
+        gui_thread = threading.Thread(target=update_gui, 
+                                   args=(ocr_results_queue, plate_label, time_label, 
+                                         status_label, payment_label), 
+                                   daemon=True)
+        ir_thread = threading.Thread(target=ir_light_controller, daemon=True)
+
+        gui_thread.start()
+        ir_thread.start()
+
+        # Initialize camera
+        cap = cv2.VideoCapture(0)
         if not cap.isOpened():
-            raise ValueError("ไม่สามารถเปิดกล้องได้")
+            raise ValueError("Cannot open camera")
+            
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        # trigger zone สำหรับภาพขนาด 640x640
-        trigger_zone = ((200, 400), (500, 600))
+        # Calculate trigger zone
+        trigger_zone = (
+            (int(YOLO_WIDTH * ZONE_LEFT/100), int(YOLO_HEIGHT * ZONE_TOP/100)),
+            (int(YOLO_WIDTH * ZONE_RIGHT/100), int(YOLO_HEIGHT * ZONE_BOTTOM/100))
+        )
+        
         last_ocr_time = 0
-        ocr_results = []
-
         stop_event.clear()
-        frame_queue = queue.Queue(maxsize=10)
 
+        # Start image processing threads
         capture_thread = threading.Thread(target=capture_frame, args=(cap, frame_queue), daemon=True)
-        process_thread = threading.Thread(target=process_frame, args=(frame_queue, model, last_ocr_time, trigger_zone, model_path, font_path, ocr_results), daemon=True)
-
+        process_thread = threading.Thread(target=process_frame, 
+                                       args=(frame_queue, model, last_ocr_time, trigger_zone, 
+                                             model_path, font_path, ocr_results_queue), 
+                                       daemon=True)
+        
         capture_thread.start()
         process_thread.start()
 
-        while not stop_event.is_set():
-            time.sleep(0.1)
-
-        print("รอให้ threads จบการทำงาน...")
-        capture_thread.join(timeout=2)
-        process_thread.join(timeout=2)
+        root.mainloop()
 
     except Exception as e:
-        print(f"\nเกิดข้อผิดพลาด: {str(e)}")
+        print(f"\nError occurred: {str(e)}")
         stop_event.set()
     finally:
         stop_event.set()
         if 'cap' in locals():
             cap.release()
         cv2.destroyAllWindows()
+        cleanup_gpio()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nProgram terminated by Ctrl+C")
+    finally:
+        stop_event.set()
+        cleanup_gpio()
