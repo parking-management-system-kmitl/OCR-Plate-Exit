@@ -5,9 +5,6 @@ import time
 import queue
 import threading
 from datetime import datetime
-from autoTransform.transform import process_auto_transform
-from splitImage.split import process_split_image
-from readLicense.read import process_read_license
 from ultralytics import YOLO
 import tkinter as tk
 from tkinter import ttk
@@ -18,6 +15,10 @@ import requests
 import io
 import numpy as np
 import datetime
+
+from autoTransform.transform import process_auto_transform
+from splitImage.split import process_split_image
+from readLicense.read import process_read_license
 
 warnings.filterwarnings("ignore")
 
@@ -30,7 +31,7 @@ DISPLAY_HEIGHT = 480
 FPS = 60
 
 
-API_URL = "http://10.240.67.29:3000/parking/exit"
+API_URL = "http://10.240.67.29:3000"
 
 
 # GPIO pins
@@ -94,7 +95,7 @@ def send_exit_request(license_plate: str, ocr_results_queue):
     """Send exit request to server and handle the response"""
     try:
         data = {"licensePlate": license_plate}
-        response = requests.post(API_URL, json=data)
+        response = requests.post(API_URL+"/parking/exit", json=data)
         response_data = response.json()
 
         if response.status_code == 200:
@@ -196,17 +197,7 @@ def update_gui(ocr_results_queue, plate_label, time_label, status_label, payment
         time.sleep(0.1)
 
 def add_padding_to_bbox(xmin, ymin, xmax, ymax, frame_height, frame_width, padding_percent=10):
-    """
-    เพิ่มพื้นที่ padding รอบ bounding box โดยรักษาขอบเขตของ frame
-    
-    Args:
-        xmin, ymin, xmax, ymax: พิกัดของ bounding box
-        frame_height, frame_width: ขนาดของ frame
-        padding_percent: เปอร์เซ็นต์ของ padding ที่ต้องการเพิ่ม (default: 10%)
-    
-    Returns:
-        tuple: (xmin, ymin, xmax, ymax) ที่มี padding แล้ว
-    """
+
     # คำนวณขนาดของ padding
     width = xmax - xmin
     height = ymax - ymin
@@ -254,19 +245,6 @@ def process_frame(frame_queue, model, last_ocr_time, trigger_zone, model_path, f
     trigger_start_time = 0
     last_ocr_time = time.time()
     min_confidence_threshold = 0.6
-
-
-        # สร้างหน้าต่างแสดงภาพทั้งหมดครั้งเดียวตอนเริ่มต้น
-    #cv2.namedWindow("License Plate Original", cv2.WINDOW_NORMAL)
-    #cv2.namedWindow("License Plate Processed", cv2.WINDOW_NORMAL)
-    #cv2.namedWindow("License Plate Transformed", cv2.WINDOW_NORMAL) 
-    #cv2.namedWindow("License Plate OCR Input", cv2.WINDOW_NORMAL)
-
-    # กำหนดขนาดหน้าต่างครั้งเดียว
-    #cv2.resizeWindow("License Plate Original", 400, 200)
-    #cv2.resizeWindow("License Plate Processed", 400, 200)
-    #cv2.resizeWindow("License Plate Transformed", 400, 200)
-    #cv2.resizeWindow("License Plate OCR Input", 400, 200)
     
     while not stop_event.is_set():
         try:
@@ -335,9 +313,6 @@ def process_frame(frame_queue, model, last_ocr_time, trigger_zone, model_path, f
                                     current_time = time.time()
                                     if current_time - last_ocr_time >= 1:  # 1 second delay between OCR attempts
                                         # Perform OCR
-
-
-                                        
                                         
                                         # เพิ่ม padding ให้กับ bounding box
                                         padded_xmin, padded_ymin, padded_xmax, padded_ymax = add_padding_to_bbox(
@@ -349,41 +324,22 @@ def process_frame(frame_queue, model, last_ocr_time, trigger_zone, model_path, f
                                         # ตัดภาพด้วย padding
                                         plate_img = original_frame[padded_ymin:padded_ymax, padded_xmin:padded_xmax]
                                         
-                                        
-                                        
-                                        
-                                        #plate_img = original_frame[real_ymin:real_ymax, real_xmin:real_xmax]
-
-
 
                                         if plate_img.size > 0:  # Check if plate image is valid
                                             try:
 
-                                                # แสดงภาพโดยใช้ imshow อย่างเดียว ไม่ต้องสร้างหน้าต่างใหม่
-                                                #cv2.imshow("License Plate Original", cv2.resize(plate_img, (400, 200)))
-                                                
                                                 # preprocessing
                                                 plate_img = cv2.resize(plate_img, (OCR_SIZE, OCR_SIZE))
                                                 plate_img_gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
                                                 plate_img_eq = cv2.equalizeHist(plate_img_gray)
                                                 plate_img = cv2.cvtColor(plate_img_eq, cv2.COLOR_GRAY2BGR)
-                                                #cv2.imshow("License Plate Processed", cv2.resize(plate_img, (400, 200)))
                                                 
                                                 # transform
                                                 transformed_img = process_auto_transform(plate_img)
-                                                #cv2.imshow("License Plate Transformed", cv2.resize(transformed_img, (400, 200)))
                                                 
                                                 # split
                                                 top_img, _ = process_split_image(transformed_img)
-                                                #cv2.imshow("License Plate OCR Input", cv2.resize(top_img, (400, 200)))
-                                    
                                                 results, confidence = process_read_license(top_img, model_path, font_path)
-
-                                                #plate_img = cv2.resize(plate_img, (OCR_SIZE, OCR_SIZE))
-                                                #transformed_img = process_auto_transform(plate_img)
-                                                #top_img, _ = process_split_image(transformed_img)
-                                                #results, confidence = process_read_license(top_img, model_path, font_path)
-                                                
                                                 text = ''.join([char for char, _, _ in results])
                                                 
                                                 if text and confidence >= min_confidence_threshold:
@@ -480,9 +436,10 @@ def main():
                                          status_label, payment_label), 
                                    daemon=True)
         ir_thread = threading.Thread(target=ir_light_controller, daemon=True)
-
-        gui_thread.start()
         ir_thread.start()
+        
+        gui_thread.start()
+        
 
         # Initialize camera
         cap = cv2.VideoCapture(0)
