@@ -29,6 +29,10 @@ DISPLAY_WIDTH = 640
 DISPLAY_HEIGHT = 480
 FPS = 60
 
+
+API_URL = "http://10.240.67.29:3000/parking/exit"
+
+
 # GPIO pins
 RED_LIGHT_PIN = 16
 GREEN_LIGHT_PIN = 18
@@ -43,8 +47,7 @@ ZONE_BOTTOM = 100
 stop_event = threading.Event()
 last_successful_plate = None
 current_frame = None
-#API_URL = "http://jjsornwakii.3bbddns.com:34724/parking/exit"
-API_URL = "http://10.240.67.29:3000/parking/exit"
+
 
 def setup_gpio():
     """Initialize GPIO settings"""
