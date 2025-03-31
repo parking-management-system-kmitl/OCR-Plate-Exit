@@ -31,7 +31,7 @@ DISPLAY_HEIGHT = 480
 FPS = 60
 
 
-API_URL = "http://10.240.67.29:3000"
+API_SERVER = "http://10.240.67.29:3000"
 
 
 # GPIO pins
@@ -95,7 +95,7 @@ def send_exit_request(license_plate: str, ocr_results_queue):
     """Send exit request to server and handle the response"""
     try:
         data = {"licensePlate": license_plate}
-        response = requests.post(API_URL+"/parking/exit", json=data)
+        response = requests.post(API_SERVER+"/parking/exit", json=data)
         response_data = response.json()
 
         if response.status_code == 200:
